@@ -42,6 +42,9 @@ pub struct ArcherAmm {
 
     pub base_token_program: Pubkey,
     pub quote_token_program: Pubkey,
+
+    /// Quote token account that receives the integrator's share of taker fees.
+    pub integrator_fee_wallet: Pubkey,
 }
 
 impl Amm for ArcherAmm {
@@ -76,6 +79,7 @@ impl Amm for ArcherAmm {
             taker_order_book: None,
             base_token_program: SPL_TOKEN_PROGRAM,
             quote_token_program: SPL_TOKEN_PROGRAM,
+            integrator_fee_wallet: Pubkey::default(),
         })
     }
 
@@ -219,6 +223,7 @@ impl Amm for ArcherAmm {
         let mut account_metas = vec![
             AccountMeta::new_readonly(swap_params.token_transfer_authority, true),
             AccountMeta::new(self.market_key, false),
+            AccountMeta::new(self.integrator_fee_wallet, false),
         ];
 
         if self.taker_order_book.is_some() {
