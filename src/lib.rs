@@ -242,7 +242,10 @@ impl Amm for ArcherAmm {
             AccountMeta::new_readonly(instruction_sysvar, false),
         ]);
 
-        for (book_key, _) in &self.maker_books {
+        for (book_key, book) in &self.maker_books {
+            if !book.is_active() {
+                continue;
+            }
             account_metas.push(AccountMeta::new(*book_key, false));
         }
 
