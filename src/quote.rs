@@ -9,6 +9,7 @@ struct AggregatedLevel {
     size_base_lots: u64,
     is_limit_order: bool,
     sequence_number: u64,
+    maker_index: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -109,39 +110,122 @@ fn quote_buy_exact_in(
             .cmp(&b.price_ticks)
             .then(a.is_limit_order.cmp(&b.is_limit_order).reverse()) // true (LO) before false (maker)
             .then(a.sequence_number.cmp(&b.sequence_number))
+            .then(a.maker_index.cmp(&b.maker_index))
     });
 
     let mut remaining_quote_lots = matching_amount;
     let mut total_base_lots_out = 0u64;
     let mut total_quote_lots_matched = 0u64;
 
-    for level in &all_asks {
-        if remaining_quote_lots == 0 {
+    let mut i = 0;
+    while i < all_asks.len() && remaining_quote_lots > 0 {
+        let price = all_asks[i].price_ticks;
+
+        let group_end = {
+            let mut j = i + 1;
+            while j < all_asks.len() && all_asks[j].price_ticks == price {
+                j += 1;
+            }
+            j
+        };
+
+        let total_size: u64 = all_asks[i..group_end]
+            .iter()
+            .map(|l| l.size_base_lots)
+            .sum();
+
+        let max_base = quote_to_base_lots(header, remaining_quote_lots, price, false)?;
+        let base_to_fill = max_base.min(total_size);
+
+        if base_to_fill == 0 {
             break;
         }
 
-        let max_base = quote_to_base_lots(header, remaining_quote_lots, level.price_ticks, false)?;
-        let fill_base = max_base.min(level.size_base_lots);
+        let lo_end = {
+            let mut k = i;
+            while k < group_end && all_asks[k].is_limit_order {
+                k += 1;
+            }
+            k
+        };
 
-        if fill_base == 0 {
-            break;
+        let mut filled_base = 0u64;
+        let mut filled_quote = 0u64;
+
+        for idx in i..lo_end {
+            if filled_base >= base_to_fill {
+                break;
+            }
+            let lo_fill = (base_to_fill - filled_base).min(all_asks[idx].size_base_lots);
+            if lo_fill == 0 {
+                continue;
+            }
+
+            let quote_cost = base_to_quote_lots(header, lo_fill, price, true)?;
+
+            filled_base = filled_base
+                .checked_add(lo_fill)
+                .ok_or_else(|| ArcherAmmError::MathError("base overflow".into()))?;
+            filled_quote = filled_quote
+                .checked_add(quote_cost)
+                .ok_or_else(|| ArcherAmmError::MathError("quote overflow".into()))?;
         }
 
-        let quote_cost = base_to_quote_lots(header, fill_base, level.price_ticks, true)?;
+        let remaining_at_price = base_to_fill.saturating_sub(filled_base);
+        if remaining_at_price > 0 {
+            let maker_levels = &all_asks[lo_end..group_end];
+            let total_maker_size: u64 = maker_levels.iter().map(|l| l.size_base_lots).sum();
 
-        if quote_cost > remaining_quote_lots {
-            break;
+            if total_maker_size > 0 {
+                let num_makers = maker_levels.len();
+                let mut distributed = 0u64;
+
+                for (idx, maker) in maker_levels.iter().enumerate() {
+                    let is_last = idx == num_makers - 1;
+
+                    let share = if is_last {
+                        remaining_at_price
+                            .saturating_sub(distributed)
+                            .min(maker.size_base_lots)
+                    } else {
+                        calculate_pro_rata(
+                            remaining_at_price,
+                            maker.size_base_lots,
+                            total_maker_size,
+                        )?
+                        .min(maker.size_base_lots)
+                    };
+
+                    if share == 0 {
+                        continue;
+                    }
+
+                    let quote_cost = base_to_quote_lots(header, share, price, true)?;
+
+                    filled_base = filled_base
+                        .checked_add(share)
+                        .ok_or_else(|| ArcherAmmError::MathError("base overflow".into()))?;
+                    filled_quote = filled_quote
+                        .checked_add(quote_cost)
+                        .ok_or_else(|| ArcherAmmError::MathError("quote overflow".into()))?;
+                    distributed = distributed
+                        .checked_add(share)
+                        .ok_or_else(|| ArcherAmmError::MathError("base overflow".into()))?;
+                }
+            }
         }
 
         remaining_quote_lots = remaining_quote_lots
-            .checked_sub(quote_cost)
+            .checked_sub(filled_quote)
             .ok_or_else(|| ArcherAmmError::MathError("remaining underflow".into()))?;
         total_quote_lots_matched = total_quote_lots_matched
-            .checked_add(quote_cost)
+            .checked_add(filled_quote)
             .ok_or_else(|| ArcherAmmError::MathError("quote overflow".into()))?;
         total_base_lots_out = total_base_lots_out
-            .checked_add(fill_base)
+            .checked_add(filled_base)
             .ok_or_else(|| ArcherAmmError::MathError("base overflow".into()))?;
+
+        i = group_end;
     }
 
     let taker_fee_lots = calculate_fee(total_quote_lots_matched, effective_taker_fee_ppm)?;
@@ -191,30 +275,112 @@ fn quote_sell_exact_in(
             .cmp(&a.price_ticks)
             .then(a.is_limit_order.cmp(&b.is_limit_order).reverse()) // true (LO) before false (maker)
             .then(a.sequence_number.cmp(&b.sequence_number))
+            .then(a.maker_index.cmp(&b.maker_index))
     });
 
     let mut remaining_base_lots = input_base_lots;
     let mut total_quote_lots_matched = 0u64;
 
-    for level in &all_bids {
-        if remaining_base_lots == 0 {
-            break;
-        }
+    let mut i = 0;
+    while i < all_bids.len() && remaining_base_lots > 0 {
+        let price = all_bids[i].price_ticks;
 
-        let fill_base = remaining_base_lots.min(level.size_base_lots);
-        if fill_base == 0 {
+        let group_end = {
+            let mut j = i + 1;
+            while j < all_bids.len() && all_bids[j].price_ticks == price {
+                j += 1;
+            }
+            j
+        };
+
+        let total_size: u64 = all_bids[i..group_end]
+            .iter()
+            .map(|l| l.size_base_lots)
+            .sum();
+
+        let base_to_fill = remaining_base_lots.min(total_size);
+        if base_to_fill == 0 {
+            i = group_end;
             continue;
         }
 
-        // Quote received for this fill: floor (Ask side)
-        let quote_received = base_to_quote_lots(header, fill_base, level.price_ticks, false)?;
+        // Find boundary between LOs and makers within this price group
+        let lo_end = {
+            let mut k = i;
+            while k < group_end && all_bids[k].is_limit_order {
+                k += 1;
+            }
+            k
+        };
+
+        let mut filled_base = 0u64;
+
+        for idx in i..lo_end {
+            if filled_base >= base_to_fill {
+                break;
+            }
+            let lo_fill = (base_to_fill - filled_base).min(all_bids[idx].size_base_lots);
+            if lo_fill == 0 {
+                continue;
+            }
+
+            let quote_received = base_to_quote_lots(header, lo_fill, price, false)?;
+            total_quote_lots_matched = total_quote_lots_matched
+                .checked_add(quote_received)
+                .ok_or_else(|| ArcherAmmError::MathError("quote overflow".into()))?;
+            filled_base = filled_base
+                .checked_add(lo_fill)
+                .ok_or_else(|| ArcherAmmError::MathError("base overflow".into()))?;
+        }
+
+        let remaining_at_price = base_to_fill.saturating_sub(filled_base);
+        if remaining_at_price > 0 {
+            let maker_levels = &all_bids[lo_end..group_end];
+            let total_maker_size: u64 = maker_levels.iter().map(|l| l.size_base_lots).sum();
+
+            if total_maker_size > 0 {
+                let num_makers = maker_levels.len();
+                let mut distributed = 0u64;
+
+                for (idx, maker) in maker_levels.iter().enumerate() {
+                    let is_last = idx == num_makers - 1;
+
+                    let share = if is_last {
+                        remaining_at_price
+                            .saturating_sub(distributed)
+                            .min(maker.size_base_lots)
+                    } else {
+                        calculate_pro_rata(
+                            remaining_at_price,
+                            maker.size_base_lots,
+                            total_maker_size,
+                        )?
+                        .min(maker.size_base_lots)
+                    };
+
+                    if share == 0 {
+                        continue;
+                    }
+
+                    let quote_received = base_to_quote_lots(header, share, price, false)?;
+                    total_quote_lots_matched = total_quote_lots_matched
+                        .checked_add(quote_received)
+                        .ok_or_else(|| ArcherAmmError::MathError("quote overflow".into()))?;
+                    filled_base = filled_base
+                        .checked_add(share)
+                        .ok_or_else(|| ArcherAmmError::MathError("base overflow".into()))?;
+                    distributed = distributed
+                        .checked_add(share)
+                        .ok_or_else(|| ArcherAmmError::MathError("base overflow".into()))?;
+                }
+            }
+        }
 
         remaining_base_lots = remaining_base_lots
-            .checked_sub(fill_base)
+            .checked_sub(filled_base)
             .ok_or_else(|| ArcherAmmError::MathError("remaining underflow".into()))?;
-        total_quote_lots_matched = total_quote_lots_matched
-            .checked_add(quote_received)
-            .ok_or_else(|| ArcherAmmError::MathError("quote overflow".into()))?;
+
+        i = group_end;
     }
 
     let taker_fee_lots = calculate_fee(total_quote_lots_matched, effective_taker_fee_ppm)?;
@@ -258,7 +424,7 @@ fn collect_all_levels(
 ) -> Vec<AggregatedLevel> {
     let mut levels = Vec::new();
 
-    for (_, book) in maker_books {
+    for (maker_idx, (_, book)) in maker_books.iter().enumerate() {
         if !book.is_active() {
             continue;
         }
@@ -307,6 +473,7 @@ fn collect_all_levels(
                 size_base_lots: level.size_in_base_lots,
                 is_limit_order: false,
                 sequence_number: u64::MAX,
+                maker_index: maker_idx,
             });
         }
     }
@@ -333,6 +500,7 @@ fn collect_all_levels(
                 size_base_lots: order.remaining_base_lots,
                 is_limit_order: true,
                 sequence_number: order.sequence_number,
+                maker_index: 0,
             });
         }
     }
@@ -431,6 +599,22 @@ fn quote_to_base_lots(
     }
 
     Ok(base_lots as u64)
+}
+
+fn calculate_pro_rata(
+    total: u64,
+    share: u64,
+    total_shares: u64,
+) -> Result<u64, ArcherAmmError> {
+    if total_shares == 0 {
+        return Err(ArcherAmmError::MathError("pro-rata div zero".into()));
+    }
+    let result = (total as u128)
+        .checked_mul(share as u128)
+        .ok_or_else(|| ArcherAmmError::MathError("pro-rata overflow".into()))?
+        .checked_div(total_shares as u128)
+        .ok_or_else(|| ArcherAmmError::MathError("pro-rata div zero".into()))?;
+    Ok(result as u64)
 }
 
 fn calculate_fee(quote_lots: u64, fee_ppm: i32) -> Result<i64, ArcherAmmError> {

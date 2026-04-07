@@ -245,6 +245,24 @@ mod simulations {
             }
         }
 
+        // Create a synthetic integrator fee wallet for testing purposes
+        let integrator_fee_wallet = Keypair::new();
+        let mut fee_account = Account::new(
+            LAMPORTS_PER_SOL,
+            TokenAccount::LEN,
+            &quote_token_program,
+        );
+        let mut fee_token_data = TokenAccount::default();
+        fee_token_data.mint = quote_mint;
+        fee_token_data.owner = keypair.pubkey();
+        fee_token_data.state = AccountState::Initialized;
+        fee_token_data.amount = 0;
+        fee_token_data.pack_into_slice(fee_account.data_as_mut_slice());
+        litesvm
+            .set_account(integrator_fee_wallet.pubkey(), fee_account.into())
+            .unwrap();
+        amm.integrator_fee_wallet = integrator_fee_wallet.pubkey();
+
         // Re-initialize AMM from LiteSVM's frozen state
         let accounts_to_update = amm.get_accounts_to_update();
         let account_map = svm_account_map(litesvm, &accounts_to_update);
