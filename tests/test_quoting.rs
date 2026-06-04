@@ -214,7 +214,7 @@ mod simulations {
         let ix_sell = amm.get_swap_and_account_metas(&swap_params_sell).unwrap();
 
         // Collect all unique account pubkeys (excluding user ATAs)
-        let mut all_pks: Vec<Pubkey> = vec![amm.registry_key, amm.taker_book_key];
+        let mut all_pks: Vec<Pubkey> = vec![amm.registry_key];
         for sam in [&ix_buy, &ix_sell] {
             for acc in &sam.account_metas {
                 if acc.pubkey != dummy_ata_base
@@ -459,6 +459,10 @@ mod simulations {
         let latest_clock: Clock = bincode::deserialize(&clock_account.data).unwrap();
         litesvm.set_sysvar::<Clock>(&latest_clock);
 
+        // Mirror the simulator clock into the AMM so off-chain staleness/epoch
+        // handling matches on-chain execution.
+        amm.clock_ref.update(latest_clock.clone());
+
         snapshot_state_into_svm(&mut amm, &rpc, &mut litesvm, &keypair);
 
         let mints = amm.get_reserve_mints();
@@ -522,6 +526,10 @@ mod simulations {
         let clock_account = rpc.get_account(&clock::ID).await.unwrap();
         let latest_clock: Clock = bincode::deserialize(&clock_account.data).unwrap();
         litesvm.set_sysvar::<Clock>(&latest_clock);
+
+        // Mirror the simulator clock into the AMM so off-chain staleness/epoch
+        // handling matches on-chain execution.
+        amm.clock_ref.update(latest_clock.clone());
 
         snapshot_state_into_svm(&mut amm, &rpc, &mut litesvm, &keypair);
 

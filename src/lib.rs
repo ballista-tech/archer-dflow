@@ -2,20 +2,21 @@ pub mod error;
 pub mod quote;
 pub mod state;
 
+use std::sync::atomic::Ordering;
+
 use anyhow::{anyhow, Result};
 use solana_program::instruction::AccountMeta;
 use solana_program::pubkey::Pubkey;
 
 use dflow_amm_interface::{
-    AccountMap, Amm, AmmContext, KeyedAccount, Quote, QuoteParams, Swap, SwapAndAccountMetas,
-    SwapParams,
+    AccountMap, Amm, AmmContext, ClockRef, KeyedAccount, Quote, QuoteParams, Swap,
+    SwapAndAccountMetas, SwapParams,
 };
 
-use crate::quote::{compute_quote_with_taker_book, QuoteOutput};
+use crate::quote::{compute_quote, QuoteOutput};
 use crate::state::{
-    deserialize_maker_book, deserialize_market_header, deserialize_registry,
-    deserialize_taker_order_book, MakerBook, MarketStateHeader, TakerOrderBook,
-    MARKET_DISCRIMINATOR, TAKER_ORDER_BOOK_DISCRIMINATOR,
+    deserialize_maker_book, deserialize_market_header, deserialize_registry, MakerBook,
+    MarketStateHeader, MARKET_DISCRIMINATOR,
 };
 
 pub const ARCHER_PROGRAM_ID: Pubkey =
@@ -33,24 +34,37 @@ const TOKEN_2022_PROGRAM: Pubkey =
 pub struct ArcherAmm {
     pub market_key: Pubkey,
     pub registry_key: Pubkey,
-    pub taker_book_key: Pubkey,
 
     pub market_header: Option<MarketStateHeader>,
     pub maker_book_keys: Vec<Pubkey>,
     pub maker_books: Vec<(Pubkey, MakerBook)>,
-    pub taker_order_book: Option<Box<TakerOrderBook>>,
 
     pub base_token_program: Pubkey,
     pub quote_token_program: Pubkey,
+
+    base_mint_data: Vec<u8>,
+    quote_mint_data: Vec<u8>,
+
+    pub clock_ref: ClockRef,
 
     /// Quote token account that receives the integrator's share of taker fees.
     pub integrator_fee_wallet: Pubkey,
 }
 
+impl ArcherAmm {
+    fn current_slot(&self) -> u64 {
+        self.clock_ref.slot.load(Ordering::Relaxed)
+    }
+
+    fn current_epoch(&self) -> u64 {
+        self.clock_ref.epoch.load(Ordering::Relaxed)
+    }
+}
+
 impl Amm for ArcherAmm {
     fn from_keyed_account(
         keyed_account: &KeyedAccount,
-        _amm_context: &AmmContext,
+        amm_context: &AmmContext,
     ) -> Result<Self> {
         let market_key = keyed_account.key;
         let data = &keyed_account.account.data;
@@ -64,21 +78,17 @@ impl Amm for ArcherAmm {
             &ARCHER_PROGRAM_ID,
         );
 
-        let (taker_book_key, _) = Pubkey::find_program_address(
-            &[b"taker_book", market_key.as_ref()],
-            &ARCHER_PROGRAM_ID,
-        );
-
         Ok(Self {
             market_key,
             registry_key,
-            taker_book_key,
             market_header: None,
             maker_book_keys: vec![],
             maker_books: vec![],
-            taker_order_book: None,
             base_token_program: SPL_TOKEN_PROGRAM,
             quote_token_program: SPL_TOKEN_PROGRAM,
+            base_mint_data: vec![],
+            quote_mint_data: vec![],
+            clock_ref: amm_context.clock_ref.clone(),
             integrator_fee_wallet: Pubkey::default(),
         })
     }
@@ -103,7 +113,7 @@ impl Amm for ArcherAmm {
     }
 
     fn get_accounts_to_update(&self) -> Vec<Pubkey> {
-        let mut accounts = vec![self.market_key, self.registry_key, self.taker_book_key];
+        let mut accounts = vec![self.market_key, self.registry_key];
         accounts.extend_from_slice(&self.maker_book_keys);
         if let Some(h) = &self.market_header {
             accounts.push(h.base_mint);
@@ -123,10 +133,12 @@ impl Amm for ArcherAmm {
             if let Some(base_mint_account) = account_map.get(&header.base_mint) {
                 self.base_token_program =
                     detect_token_program_from_data(&base_mint_account.data);
+                self.base_mint_data = base_mint_account.data.clone();
             }
             if let Some(quote_mint_account) = account_map.get(&header.quote_mint) {
                 self.quote_token_program =
                     detect_token_program_from_data(&quote_mint_account.data);
+                self.quote_mint_data = quote_mint_account.data.clone();
             }
         }
 
@@ -151,16 +163,6 @@ impl Amm for ArcherAmm {
             }
         }
 
-        self.taker_order_book = None;
-        if let Some(tob_account) = account_map.get(&self.taker_book_key) {
-            let data = &tob_account.data;
-            if data.len() >= 8 && &data[0..8] == TAKER_ORDER_BOOK_DISCRIMINATOR {
-                if let Ok(tob) = deserialize_taker_order_book(data) {
-                    self.taker_order_book = Some(Box::new(tob));
-                }
-            }
-        }
-
         Ok(())
     }
 
@@ -175,22 +177,60 @@ impl Amm for ArcherAmm {
         }
 
         let is_buy = quote_params.input_mint == header.quote_mint;
+        let current_slot = self.current_slot();
+        let current_epoch = self.current_epoch();
+
+        let (input_mint_data, input_token_program, output_mint_data, output_token_program) =
+            if is_buy {
+                (
+                    &self.quote_mint_data,
+                    &self.quote_token_program,
+                    &self.base_mint_data,
+                    &self.base_token_program,
+                )
+            } else {
+                (
+                    &self.base_mint_data,
+                    &self.base_token_program,
+                    &self.quote_mint_data,
+                    &self.quote_token_program,
+                )
+            };
+
+        let input_transfer_fee = transfer_fee_atoms(
+            input_mint_data,
+            input_token_program,
+            quote_params.amount,
+            current_epoch,
+        )
+        .map_err(|e| anyhow!("{e}"))?;
+        let net_input = quote_params.amount.saturating_sub(input_transfer_fee);
 
         let QuoteOutput {
             out_amount,
             fee_amount: _,
-        } = compute_quote_with_taker_book(
-            quote_params.amount,
+        } = compute_quote(
+            net_input,
             is_buy,
             header,
             &self.maker_books,
-            self.taker_order_book.as_deref(),
+            current_slot,
+            None,
         )
         .map_err(|e| anyhow!("{e}"))?;
 
+        let output_transfer_fee = transfer_fee_atoms(
+            output_mint_data,
+            output_token_program,
+            out_amount,
+            current_epoch,
+        )
+        .map_err(|e| anyhow!("{e}"))?;
+        let net_output = out_amount.saturating_sub(output_transfer_fee);
+
         Ok(Quote {
             in_amount: quote_params.amount,
-            out_amount,
+            out_amount: net_output,
         })
     }
 
@@ -218,19 +258,10 @@ impl Amm for ArcherAmm {
             )
         };
 
-        let instruction_sysvar = solana_program::sysvar::instructions::ID;
-
         let mut account_metas = vec![
             AccountMeta::new_readonly(swap_params.token_transfer_authority, true),
             AccountMeta::new(self.market_key, false),
             AccountMeta::new(self.integrator_fee_wallet, false),
-        ];
-
-        if self.taker_order_book.is_some() {
-            account_metas.push(AccountMeta::new(self.taker_book_key, false));
-        }
-
-        account_metas.extend_from_slice(&[
             AccountMeta::new_readonly(header.base_mint, false),
             AccountMeta::new_readonly(header.quote_mint, false),
             AccountMeta::new(header.base_vault, false),
@@ -239,14 +270,13 @@ impl Amm for ArcherAmm {
             AccountMeta::new(taker_quote_ata, false),
             AccountMeta::new_readonly(self.base_token_program, false),
             AccountMeta::new_readonly(self.quote_token_program, false),
-            AccountMeta::new_readonly(instruction_sysvar, false),
-        ]);
+        ];
 
+        let current_slot = self.current_slot();
         for (book_key, book) in &self.maker_books {
-            if !book.is_active() {
-                continue;
+            if book.is_active() && !book.is_stale(current_slot) {
+                account_metas.push(AccountMeta::new(*book_key, false));
             }
-            account_metas.push(AccountMeta::new(*book_key, false));
         }
 
         let input_lots = if is_buy {
@@ -298,13 +328,8 @@ impl Amm for ArcherAmm {
     }
 
     fn get_accounts_len(&self) -> usize {
-        // Fixed accounts (11 or 12 with taker book) + maker books
-        let base = if self.taker_order_book.is_some() {
-            12
-        } else {
-            11
-        };
-        base + self.maker_books.len()
+        // 11 fixed accounts + maker books
+        11 + self.maker_books.len()
     }
 }
 
@@ -314,4 +339,34 @@ fn detect_token_program_from_data(mint_data: &[u8]) -> Pubkey {
     } else {
         SPL_TOKEN_PROGRAM
     }
+}
+
+fn transfer_fee_atoms(
+    mint_data: &[u8],
+    token_program: &Pubkey,
+    amount: u64,
+    epoch: u64,
+) -> Result<u64> {
+    if *token_program != TOKEN_2022_PROGRAM || mint_data.is_empty() {
+        return Ok(0);
+    }
+
+    use spl_token_2022::extension::{
+        transfer_fee::TransferFeeConfig, BaseStateWithExtensions, StateWithExtensions,
+    };
+    use spl_token_2022::state::Mint;
+
+    let state = StateWithExtensions::<Mint>::unpack(mint_data)
+        .map_err(|e| anyhow!("mint unpack: {e}"))?;
+
+    let cfg = match state.get_extension::<TransferFeeConfig>() {
+        Ok(cfg) => cfg,
+        Err(_) => return Ok(0),
+    };
+
+    let fee = cfg
+        .calculate_epoch_fee(epoch, amount)
+        .ok_or_else(|| anyhow!("transfer fee overflow"))?;
+
+    Ok(fee)
 }
