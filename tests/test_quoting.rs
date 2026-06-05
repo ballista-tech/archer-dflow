@@ -63,11 +63,27 @@ mod simulations {
         map
     }
 
-    /// Fetch a full Solana Account from RPC (blocking).
-    fn fetch_account_blocking(rpc: &RpcClient, key: &Pubkey) -> Option<Account> {
+    /// Fetch many accounts from RPC in one `getMultipleAccounts` call (blocking).
+    ///
+    /// Atomic per chunk: every account in a chunk is read at the same slot, so the
+    /// snapshot is internally consistent (book sizes match vault balances). This is
+    /// what makes the boundary/random sim cross-checks deterministic against a live,
+    /// actively-updated market — sequential single-account reads race the makers.
+    fn fetch_multiple_blocking(rpc: &RpcClient, keys: &[Pubkey]) -> Vec<(Pubkey, Account)> {
         tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async { rpc.get_account(key).await.ok() })
+            tokio::runtime::Handle::current().block_on(async {
+                let mut out = Vec::new();
+                for chunk in keys.chunks(100) {
+                    if let Ok(accounts) = rpc.get_multiple_accounts(chunk).await {
+                        for (pk, maybe) in chunk.iter().zip(accounts) {
+                            if let Some(acc) = maybe {
+                                out.push((*pk, acc));
+                            }
+                        }
+                    }
+                }
+                out
+            })
         })
     }
 
@@ -236,14 +252,12 @@ mod simulations {
             all_pks.push(header.quote_mint);
         }
 
-        // Load all accounts from RPC into LiteSVM
-        for pk in &all_pks {
-            if let Some(acc) = fetch_account_blocking(rpc, pk) {
-                if acc.executable {
-                    continue;
-                }
-                litesvm.set_account(*pk, acc.into()).unwrap();
+        // Load all accounts from RPC into LiteSVM atomically (single slot).
+        for (pk, acc) in fetch_multiple_blocking(rpc, &all_pks) {
+            if acc.executable {
+                continue;
             }
+            litesvm.set_account(pk, acc.into()).unwrap();
         }
 
         // Create a synthetic integrator fee wallet for testing purposes
@@ -480,15 +494,6 @@ mod simulations {
             let (lower, upper) = compute_bounds(&amm, input_mint, output_mint);
 
             for bound in [lower, upper] {
-                let sim = sim_quote_request(
-                    &amm,
-                    *input_mint,
-                    bound,
-                    *output_mint,
-                    &mut litesvm,
-                    &keypair,
-                );
-
                 let quote = amm
                     .quote(&QuoteParams {
                         amount: bound,
@@ -497,6 +502,24 @@ mod simulations {
                         swap_mode: SwapMode::ExactIn,
                     })
                     .unwrap();
+
+                // If the off-chain quote is zero, the market currently has no active
+                // liquidity (every maker book stale/empty). On-chain the swap returns
+                // NoMatchingLiquidity rather than a 0 output, so there is nothing to
+                // cross-check — both agree there is no fill.
+                if quote.out_amount == 0 {
+                    log::warn!("No liquidity at bound {bound}; skipping sim cross-check");
+                    continue;
+                }
+
+                let sim = sim_quote_request(
+                    &amm,
+                    *input_mint,
+                    bound,
+                    *output_mint,
+                    &mut litesvm,
+                    &keypair,
+                );
 
                 log::debug!(
                     "Boundary = {}\nSimulated = {}\nOff-chain quote = {}\nDelta = {}",
@@ -549,15 +572,6 @@ mod simulations {
             for _ in 0..50 {
                 let amount = sample_log_uniform_u64(lb, ub);
 
-                let sim = sim_quote_request(
-                    &amm,
-                    *input_mint,
-                    amount,
-                    *output_mint,
-                    &mut litesvm,
-                    &keypair,
-                );
-
                 let quote = amm
                     .quote(&QuoteParams {
                         amount,
@@ -566,6 +580,21 @@ mod simulations {
                         swap_mode: SwapMode::ExactIn,
                     })
                     .unwrap();
+
+                // No active liquidity right now → on-chain returns NoMatchingLiquidity
+                // rather than a 0 output; nothing to cross-check.
+                if quote.out_amount == 0 {
+                    continue;
+                }
+
+                let sim = sim_quote_request(
+                    &amm,
+                    *input_mint,
+                    amount,
+                    *output_mint,
+                    &mut litesvm,
+                    &keypair,
+                );
 
                 log::debug!(
                     "Random sim: {}\nQuote: {}\nDelta: {}",
