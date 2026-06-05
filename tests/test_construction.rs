@@ -20,6 +20,7 @@ mod test_construction {
     use archer_dflow::ArcherAmm;
 
     fn init_test_logger() {
+        let _ = dotenvy::dotenv();
         let _ = env_logger::builder().is_test(true).try_init();
     }
 
