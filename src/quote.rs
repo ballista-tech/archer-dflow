@@ -356,7 +356,7 @@ pub fn has_matching_liquidity(
             continue;
         }
         if let Some(taker) = taker {
-            if &book.maker == taker {
+            if book.is_authorized(taker) {
                 continue;
             }
         }
@@ -394,10 +394,11 @@ fn collect_all_levels(
             continue;
         }
 
-        // Self-trades are skipped on-chain (a maker cannot fill its own book), so
-        // exclude the taker's own book here to keep the quote consistent.
+        // Self-trades are skipped on-chain (a maker — or its delegate — cannot
+        // fill its own book), so exclude any book the taker is authorized over
+        // here to keep the quote consistent.
         if let Some(taker) = taker {
-            if &book.maker == taker {
+            if book.is_authorized(taker) {
                 continue;
             }
         }
@@ -651,6 +652,40 @@ mod tests {
     }
 
     #[test]
+    fn test_has_matching_liquidity_detects_all_suspended() {
+        let mut book = empty_book(false);
+        book.ask_levels[0] = MakerLevel {
+            size_in_base_lots: 10,
+            price_offset_ticks: 5,
+        };
+        let books = vec![(Pubkey::new_unique(), book)];
+        assert!(!has_matching_liquidity(&books, true, false, 0, None));
+        assert!(!has_matching_liquidity(&books, false, false, 0, None));
+    }
+
+    #[test]
+    fn test_has_matching_liquidity_detects_active_no_levels() {
+        let book = empty_book(true);
+        let books = vec![(Pubkey::new_unique(), book)];
+        assert!(!has_matching_liquidity(&books, true, false, 0, None));
+        assert!(!has_matching_liquidity(&books, false, false, 0, None));
+    }
+
+    #[test]
+    fn test_has_matching_liquidity_hybrid_opt_out() {
+        let mut book = empty_book(true);
+        book.sync_spread_ticks = u16::MAX;
+        book.ask_levels[0] = MakerLevel {
+            size_in_base_lots: 10,
+            price_offset_ticks: 5,
+        };
+        let books = vec![(Pubkey::new_unique(), book)];
+        assert!(!has_matching_liquidity(&books, true, true, 0, None));
+        // In continuous mode the sync_spread opt-out doesn't apply.
+        assert!(has_matching_liquidity(&books, true, false, 0, None));
+    }
+
+    #[test]
     fn test_has_matching_liquidity_detects_active_with_levels() {
         let mut book = empty_book(true);
         book.ask_levels[0] = MakerLevel {
@@ -679,6 +714,17 @@ mod tests {
         assert!(!has_matching_liquidity(&books, true, false, 150, None));
         // Well past expiry — stale.
         assert!(!has_matching_liquidity(&books, true, false, 10_000, None));
+
+        // expiry_in_slots == 0 disables the check entirely.
+        let mut book = empty_book(true);
+        book.ask_levels[0] = MakerLevel {
+            size_in_base_lots: 10,
+            price_offset_ticks: 5,
+        };
+        book.last_updated_slot = 0;
+        book.expiry_in_slots = 0;
+        let books = vec![(Pubkey::new_unique(), book)];
+        assert!(has_matching_liquidity(&books, true, false, u64::MAX, None));
     }
 
     #[test]
@@ -692,10 +738,61 @@ mod tests {
         };
         let books = vec![(Pubkey::new_unique(), book)];
 
+        // Without a taker, the book is liquid.
         assert!(has_matching_liquidity(&books, true, false, 0, None));
+        // The taker's own book is excluded (self-trade guard).
         assert!(!has_matching_liquidity(&books, true, false, 0, Some(&taker)));
+        // A different taker is unaffected.
         let other = Pubkey::new_unique();
         assert!(has_matching_liquidity(&books, true, false, 0, Some(&other)));
+    }
+
+    #[test]
+    fn test_has_matching_liquidity_skips_delegate_self_trade() {
+        // The matching engine skips a book when the taker is its delegate
+        // (v1 `is_authorized`), not only when the taker is the maker.
+        let maker = Pubkey::new_unique();
+        let delegate = Pubkey::new_unique();
+        let mut book = empty_book(true);
+        book.maker = maker;
+        book.delegate = delegate;
+        book.ask_levels[0] = MakerLevel {
+            size_in_base_lots: 10,
+            price_offset_ticks: 5,
+        };
+        let books = vec![(Pubkey::new_unique(), book)];
+
+        // No taker / unrelated taker: liquid.
+        assert!(has_matching_liquidity(&books, true, false, 0, None));
+        let other = Pubkey::new_unique();
+        assert!(has_matching_liquidity(&books, true, false, 0, Some(&other)));
+
+        // Maker and delegate are both excluded (self-trade guard).
+        assert!(!has_matching_liquidity(&books, true, false, 0, Some(&maker)));
+        assert!(!has_matching_liquidity(&books, true, false, 0, Some(&delegate)));
+    }
+
+    #[test]
+    fn test_default_delegate_is_not_treated_as_taker() {
+        // A book with no delegate (default pubkey) must not accidentally exclude
+        // a taker whose key happens to be the default pubkey.
+        let mut book = empty_book(true);
+        book.maker = Pubkey::new_unique();
+        book.delegate = Pubkey::default();
+        book.ask_levels[0] = MakerLevel {
+            size_in_base_lots: 10,
+            price_offset_ticks: 5,
+        };
+        let books = vec![(Pubkey::new_unique(), book)];
+
+        let default_taker = Pubkey::default();
+        assert!(has_matching_liquidity(
+            &books,
+            true,
+            false,
+            0,
+            Some(&default_taker)
+        ));
     }
 
     #[test]
