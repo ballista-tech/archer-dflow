@@ -7,7 +7,8 @@ mod test_construction {
     //! - supports quoting for both swap directions,
     //! - and exposes sane quoting boundaries.
 
-    use std::env;
+    use archer_sdk::onchain::ArcherUnit;
+use std::env;
     use std::str::FromStr;
 
     use solana_client::nonblocking::rpc_client::RpcClient;
@@ -42,9 +43,9 @@ mod test_construction {
 
         let header = amm.market_header.as_ref().unwrap();
         let min_lot = if is_buy {
-            header.quote_atoms_per_quote_lot
+            header.quote_atoms_per_quote_lot.as_u64()
         } else {
-            header.base_atoms_per_base_lot
+            header.base_atoms_per_base_lot.as_u64()
         };
 
         let quote_output = |amount: u64| -> u64 {

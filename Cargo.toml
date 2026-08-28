@@ -5,6 +5,7 @@ edition = "2021"
 description = "Archer AMM integration for DFlow aggregator"
 
 [dependencies]
+archer-sdk = { git = "https://github.com/ballista-tech/archer-sdk", rev = "6d80857" }
 dflow-amm-interface = { path = "dflow-amm-interface" }
 solana-program = "2.2.1"
 solana-sdk = "2.2.1"
@@ -32,3 +33,4 @@ spl-associated-token-account = "6"
 litesvm = { version = "^0.6.1" }
 rand = "0.9.2"
 dotenvy = "0.15"
+
