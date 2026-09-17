@@ -277,7 +277,7 @@ use litesvm::LiteSVM;
         litesvm
             .set_account(builder_fee_wallet.pubkey(), fee_account.into())
             .unwrap();
-        amm.builder_fee_wallet = builder_fee_wallet.pubkey();
+        amm.builder_fee_wallet = Some(builder_fee_wallet.pubkey());
 
         // Re-initialize AMM from LiteSVM's frozen state
         let accounts_to_update = amm.get_accounts_to_update();
