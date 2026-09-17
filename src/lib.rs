@@ -13,7 +13,7 @@ use dflow_amm_interface::{
     SwapAndAccountMetas, SwapParams,
 };
 
-use crate::quote::{compute_quote, QuoteOutput};
+use crate::quote::{book_is_eligible, compute_quote, QuoteOutput};
 use archer_sdk::onchain::{MakerBook, MarketStateHeader, MARKET_STATE_DISCRIMINATOR};
 
 mod decode {
@@ -43,8 +43,6 @@ mod decode {
 
 pub const ARCHER_PROGRAM_ID: Pubkey =
     solana_program::pubkey!("Archer8kgiavM61GyusMzaaS2ft5sALtNsD1HxkUPMhy");
-
-const SWAP_DISCRIMINATOR: u8 = 15;
 
 const SPL_TOKEN_PROGRAM: Pubkey =
     solana_program::pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
@@ -153,13 +151,11 @@ impl Amm for ArcherAmm {
 
         if let Some(header) = &self.market_header {
             if let Some(base_mint_account) = account_map.get(&header.base_mint) {
-                self.base_token_program =
-                    detect_token_program_from_data(&base_mint_account.data);
+                self.base_token_program = token_program_for_mint(&base_mint_account.owner);
                 self.base_mint_data = base_mint_account.data.clone();
             }
             if let Some(quote_mint_account) = account_map.get(&header.quote_mint) {
-                self.quote_token_program =
-                    detect_token_program_from_data(&quote_mint_account.data);
+                self.quote_token_program = token_program_for_mint(&quote_mint_account.owner);
                 self.quote_mint_data = quote_mint_account.data.clone();
             }
         }
@@ -171,7 +167,7 @@ impl Amm for ArcherAmm {
             {
                 let registry = decode::registry(data)
                     .map_err(|e| anyhow!("Failed to deserialize registry: {e}"))?;
-                let num = registry.num_makers as usize;
+                let num = (registry.num_makers as usize).min(registry.makers.len());
                 let mut deduped: Vec<Pubkey> = Vec::with_capacity(num);
                 for key in &registry.makers[..num] {
                     if !deduped.contains(key) {
@@ -186,7 +182,9 @@ impl Amm for ArcherAmm {
         for book_key in &self.maker_book_keys {
             if let Some(book_account) = account_map.get(book_key) {
                 if let Ok(book) = decode::maker_book(&book_account.data) {
-                    self.maker_books.push((*book_key, book));
+                    if book.market == self.market_key && book.get_status().is_ok() {
+                        self.maker_books.push((*book_key, book));
+                    }
                 }
             }
         }
@@ -225,20 +223,35 @@ impl Amm for ArcherAmm {
                 )
             };
 
+        let atoms_per_lot = if is_buy {
+            header.quote_atoms_per_quote_lot.as_u64()
+        } else {
+            header.base_atoms_per_base_lot.as_u64()
+        };
+        let budget_lots = quote_params
+            .amount
+            .checked_div(atoms_per_lot)
+            .ok_or_else(|| anyhow!("lot size is 0"))?;
+        let budget_atoms = budget_lots
+            .checked_mul(atoms_per_lot)
+            .ok_or_else(|| anyhow!("budget overflow"))?;
         let input_transfer_fee = transfer_fee_atoms(
             input_mint_data,
             input_token_program,
-            quote_params.amount,
+            budget_atoms,
             current_epoch,
         )
         .map_err(|e| anyhow!("{e}"))?;
-        let net_input = quote_params.amount.saturating_sub(input_transfer_fee);
+        let available_lots = budget_atoms
+            .saturating_sub(input_transfer_fee)
+            .checked_div(atoms_per_lot)
+            .ok_or_else(|| anyhow!("lot size is 0"))?;
 
         let QuoteOutput {
             out_amount,
             fee_amount: _,
         } = compute_quote(
-            net_input,
+            available_lots,
             is_buy,
             header,
             &self.maker_books,
@@ -272,7 +285,6 @@ impl Amm for ArcherAmm {
             .ok_or_else(|| anyhow!("Market not loaded"))?;
 
         let is_buy = swap_params.source_mint == header.quote_mint;
-        let side: u8 = if is_buy { 0 } else { 1 }; // Bid=0, Ask=1
 
         let (taker_base_ata, taker_quote_ata) = if is_buy {
             (
@@ -302,29 +314,11 @@ impl Amm for ArcherAmm {
 
         let current_slot = self.current_slot();
         for (book_key, book) in &self.maker_books {
-            if !book.is_frozen() && !book.is_stale(current_slot) {
+            if book_is_eligible(book, current_slot, None, header.maker_fee_ppm) {
                 account_metas.push(AccountMeta::new(*book_key, false));
             }
         }
 
-        let input_lots = if is_buy {
-            swap_params
-                .in_amount
-                .checked_div(header.quote_atoms_per_quote_lot.as_u64())
-                .ok_or_else(|| anyhow!("quote lot size is 0"))?
-        } else {
-            swap_params
-                .in_amount
-                .checked_div(header.base_atoms_per_base_lot.as_u64())
-                .ok_or_else(|| anyhow!("base lot size is 0"))?
-        };
-
-        let mut data = Vec::with_capacity(19);
-        data.push(SWAP_DISCRIMINATOR);
-        data.extend_from_slice(&input_lots.to_le_bytes());
-        data.extend_from_slice(&0u64.to_le_bytes());
-        data.push(side);
-        data.push(0u8);
 
         Ok(SwapAndAccountMetas {
             swap: Swap::Archer,
@@ -361,8 +355,8 @@ impl Amm for ArcherAmm {
     }
 }
 
-fn detect_token_program_from_data(mint_data: &[u8]) -> Pubkey {
-    if mint_data.len() > 82 {
+fn token_program_for_mint(owner: &Pubkey) -> Pubkey {
+    if *owner == TOKEN_2022_PROGRAM {
         TOKEN_2022_PROGRAM
     } else {
         SPL_TOKEN_PROGRAM
