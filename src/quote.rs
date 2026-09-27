@@ -1,7 +1,10 @@
 use solana_program::pubkey::Pubkey;
 
 use crate::error::ArcherAmmError;
-use archer_sdk::onchain::{ArcherUnit, BaseLots, MakerBook, MarketStateHeader, Ticks, PPM_DIVISOR};
+use archer_sdk::onchain::{
+    calculate_builder_fee_quote_lots, ArcherUnit, BaseLots, MakerBook, MarketStateHeader, Ticks,
+    MAX_BUILDER_FEE_PPM, PPM_DIVISOR,
+};
 
 #[derive(Debug, Clone, Copy)]
 struct AggregatedLevel {
@@ -16,12 +19,26 @@ fn max_fill_passes(levels: &[AggregatedLevel]) -> Result<u32, ArcherAmmError> {
         .map_err(|_| ArcherAmmError::MathError("level count overflow".into()))
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct QuoteOutput {
     pub out_amount: u64,
+    /// Everything the taker pays on top of the notional, in quote atoms: the
+    /// market's taker fee (or rebate magnitude) plus the builder fee.
     pub fee_amount: u64,
+    /// The builder-fee share of `fee_amount`, in quote atoms. Zero when the
+    /// swap carries no builder fee.
+    pub builder_fee_amount: u64,
 }
 
+/// Quote an ExactIn swap of `input_lots` against `maker_books`, mirroring the
+/// program's `swap.rs` + `aggregator.rs` for the `MaxAmountIn` mode.
+///
+/// `builder_fee_ppm` must be the value the swap instruction will carry (`0` for
+/// none). The program folds it into the buy-side budget pre-scale and takes it
+/// out of the taker's quote leg on top of the taker fee, so a quote that omits
+/// it overstates the output by exactly that fee and the on-chain threshold
+/// check then fails. Values above `MAX_BUILDER_FEE_PPM` are rejected here for
+/// the same reason the program rejects them (`BuilderFeeTooHigh`).
 pub fn compute_quote(
     input_lots: u64,
     is_buy: bool,
@@ -29,28 +46,26 @@ pub fn compute_quote(
     maker_books: &[(Pubkey, MakerBook)],
     current_slot: u64,
     taker: Option<&Pubkey>,
+    builder_fee_ppm: u32,
 ) -> Result<QuoteOutput, ArcherAmmError> {
+    if builder_fee_ppm > MAX_BUILDER_FEE_PPM {
+        return Err(ArcherAmmError::MathError(format!(
+            "builder fee {builder_fee_ppm} ppm exceeds the program cap of {MAX_BUILDER_FEE_PPM}"
+        )));
+    }
+
     if input_lots == 0 {
-        return Ok(QuoteOutput {
-            out_amount: 0,
-            fee_amount: 0,
-        });
+        return Ok(QuoteOutput::default());
     }
 
     if !header.is_active() {
-        return Ok(QuoteOutput {
-            out_amount: 0,
-            fee_amount: 0,
-        });
+        return Ok(QuoteOutput::default());
     }
 
     let effective_taker_fee_ppm = header.taker_fee_ppm;
 
     if !has_matching_liquidity(maker_books, is_buy, current_slot, taker, header.maker_fee_ppm) {
-        return Ok(QuoteOutput {
-            out_amount: 0,
-            fee_amount: 0,
-        });
+        return Ok(QuoteOutput::default());
     }
 
     if is_buy {
@@ -59,6 +74,7 @@ pub fn compute_quote(
             header,
             maker_books,
             effective_taker_fee_ppm,
+            builder_fee_ppm,
             current_slot,
             taker,
         )
@@ -68,6 +84,7 @@ pub fn compute_quote(
             header,
             maker_books,
             effective_taker_fee_ppm,
+            builder_fee_ppm,
             current_slot,
             taker,
         )
@@ -79,15 +96,17 @@ fn quote_buy_exact_in(
     header: &MarketStateHeader,
     maker_books: &[(Pubkey, MakerBook)],
     effective_taker_fee_ppm: i32,
+    builder_fee_ppm: u32,
     current_slot: u64,
     taker: Option<&Pubkey>,
 ) -> Result<QuoteOutput, ArcherAmmError> {
-
-    let matching_amount = if effective_taker_fee_ppm > 0 {
+    let total_add_on_ppm = (effective_taker_fee_ppm.max(0) as u128)
+        .checked_add(builder_fee_ppm as u128)
+        .ok_or_else(|| ArcherAmmError::MathError("fee adjust overflow".into()))?;
+    let matching_amount = if total_add_on_ppm > 0 {
         let ppm = PPM_DIVISOR as u128;
-        let fee = effective_taker_fee_ppm as u128;
         let denominator = ppm
-            .checked_add(fee)
+            .checked_add(total_add_on_ppm)
             .ok_or_else(|| ArcherAmmError::MathError("fee adjust overflow".into()))?;
         let adjusted = (input_quote_lots as u128)
             .checked_mul(ppm)
@@ -171,25 +190,19 @@ fn quote_buy_exact_in(
     }
 
     let taker_fee_lots = calculate_fee(total_quote_lots_matched, effective_taker_fee_ppm)?;
+    let builder_fee_lots = builder_fee_for(total_quote_lots_matched, builder_fee_ppm)?;
 
     let out_base_atoms = total_base_lots_out
         .checked_mul(header.base_atoms_per_base_lot.as_u64())
         .ok_or_else(|| ArcherAmmError::MathError("base atoms overflow".into()))?;
 
-    let fee_atoms = if taker_fee_lots >= 0 {
-        (taker_fee_lots as u64)
-            .checked_mul(header.quote_atoms_per_quote_lot.as_u64())
-            .ok_or_else(|| ArcherAmmError::MathError("fee atoms overflow".into()))?
-    } else {
-        taker_fee_lots
-            .unsigned_abs()
-            .checked_mul(header.quote_atoms_per_quote_lot.as_u64())
-            .ok_or_else(|| ArcherAmmError::MathError("fee atoms overflow".into()))?
-    };
+    let (fee_atoms, builder_fee_atoms) =
+        fee_atoms(header, taker_fee_lots, builder_fee_lots)?;
 
     Ok(QuoteOutput {
         out_amount: out_base_atoms,
         fee_amount: fee_atoms,
+        builder_fee_amount: builder_fee_atoms,
     })
 }
 
@@ -198,6 +211,7 @@ fn quote_sell_exact_in(
     header: &MarketStateHeader,
     maker_books: &[(Pubkey, MakerBook)],
     effective_taker_fee_ppm: i32,
+    builder_fee_ppm: u32,
     current_slot: u64,
     taker: Option<&Pubkey>,
 ) -> Result<QuoteOutput, ArcherAmmError> {
@@ -265,8 +279,11 @@ fn quote_sell_exact_in(
     }
 
     let taker_fee_lots = calculate_fee(total_quote_lots_matched, effective_taker_fee_ppm)?;
+    let builder_fee_lots = builder_fee_for(total_quote_lots_matched, builder_fee_ppm)?;
 
-    let net_quote_lots = if taker_fee_lots >= 0 {
+    // What the vault pays out: notional, less the taker fee (or plus the
+    // rebate), less the builder fee — `SwapResult::quote_with_all_fees(false)`.
+    let after_taker_fee = if taker_fee_lots >= 0 {
         total_quote_lots_matched
             .checked_sub(taker_fee_lots as u64)
             .ok_or_else(|| ArcherAmmError::MathError("fee exceeds output".into()))?
@@ -275,26 +292,49 @@ fn quote_sell_exact_in(
             .checked_add(taker_fee_lots.unsigned_abs())
             .ok_or_else(|| ArcherAmmError::MathError("rebate overflow".into()))?
     };
+    let net_quote_lots = after_taker_fee
+        .checked_sub(builder_fee_lots)
+        .ok_or_else(|| ArcherAmmError::MathError("builder fee exceeds output".into()))?;
 
     let out_quote_atoms = net_quote_lots
         .checked_mul(header.quote_atoms_per_quote_lot.as_u64())
         .ok_or_else(|| ArcherAmmError::MathError("quote atoms overflow".into()))?;
 
-    let fee_atoms = if taker_fee_lots >= 0 {
-        (taker_fee_lots as u64)
-            .checked_mul(header.quote_atoms_per_quote_lot.as_u64())
-            .ok_or_else(|| ArcherAmmError::MathError("fee atoms overflow".into()))?
-    } else {
-        taker_fee_lots
-            .unsigned_abs()
-            .checked_mul(header.quote_atoms_per_quote_lot.as_u64())
-            .ok_or_else(|| ArcherAmmError::MathError("fee atoms overflow".into()))?
-    };
+    let (fee_atoms, builder_fee_atoms) =
+        fee_atoms(header, taker_fee_lots, builder_fee_lots)?;
 
     Ok(QuoteOutput {
         out_amount: out_quote_atoms,
         fee_amount: fee_atoms,
+        builder_fee_amount: builder_fee_atoms,
     })
+}
+
+/// Builder fee on the matched notional, in quote lots. Same floor rounding as
+/// the program (`calculate_builder_fee_quote_lots`).
+fn builder_fee_for(quote_lots_matched: u64, builder_fee_ppm: u32) -> Result<u64, ArcherAmmError> {
+    calculate_builder_fee_quote_lots(quote_lots_matched, builder_fee_ppm)
+        .map_err(|e| ArcherAmmError::MathError(format!("builder fee: {e:?}")))
+}
+
+/// `(taker fee magnitude + builder fee, builder fee)` converted to quote atoms.
+fn fee_atoms(
+    header: &MarketStateHeader,
+    taker_fee_lots: i64,
+    builder_fee_lots: u64,
+) -> Result<(u64, u64), ArcherAmmError> {
+    let per_lot = header.quote_atoms_per_quote_lot.as_u64();
+    let taker_fee_atoms = taker_fee_lots
+        .unsigned_abs()
+        .checked_mul(per_lot)
+        .ok_or_else(|| ArcherAmmError::MathError("fee atoms overflow".into()))?;
+    let builder_fee_atoms = builder_fee_lots
+        .checked_mul(per_lot)
+        .ok_or_else(|| ArcherAmmError::MathError("fee atoms overflow".into()))?;
+    let total = taker_fee_atoms
+        .checked_add(builder_fee_atoms)
+        .ok_or_else(|| ArcherAmmError::MathError("fee atoms overflow".into()))?;
+    Ok((total, builder_fee_atoms))
 }
 
 fn group_total(group: &[AggregatedLevel]) -> Result<u64, ArcherAmmError> {
@@ -750,15 +790,15 @@ mod tests {
         let mut all = books.clone();
         all.push((Pubkey::new_unique(), book(100, &[], &[(5, 50)], 0)));
 
-        let q = compute_quote(2 * 105, true, &h, &all, 0, None).unwrap();
+        let q = compute_quote(2 * 105, true, &h, &all, 0, None, 0).unwrap();
         assert_eq!(q.out_amount, 2 * 1_000_000, "both lots fill at 105");
         // Exactly 210 quote lots spent: the second lot came from price 105,
         // not 150.
-        let q3 = compute_quote(3 * 105, true, &h, &all, 0, None).unwrap();
+        let q3 = compute_quote(3 * 105, true, &h, &all, 0, None, 0).unwrap();
         assert_eq!(q3.out_amount, 3 * 1_000_000);
-        let q4 = compute_quote(3 * 105 + 149, true, &h, &all, 0, None).unwrap();
+        let q4 = compute_quote(3 * 105 + 149, true, &h, &all, 0, None, 0).unwrap();
         assert_eq!(q4.out_amount, 3 * 1_000_000, "149 is not enough for a lot at 150");
-        let q5 = compute_quote(3 * 105 + 150, true, &h, &all, 0, None).unwrap();
+        let q5 = compute_quote(3 * 105 + 150, true, &h, &all, 0, None, 0).unwrap();
         assert_eq!(q5.out_amount, 4 * 1_000_000);
     }
 
@@ -767,13 +807,72 @@ mod tests {
         let h = header(0, 10_000); // 1% taker fee
         let books = vec![(Pubkey::new_unique(), book(100, &[(10, -5)], &[(10, 5)], 0))];
         // 1010 quote lots gross down to 1000 -> 9 lots at 105 (945), fee ceil(9.45)=10.
-        let q = compute_quote(1_010, true, &h, &books, 0, None).unwrap();
+        let q = compute_quote(1_010, true, &h, &books, 0, None, 0).unwrap();
         assert_eq!(q.out_amount, 9 * 1_000_000);
         assert_eq!(q.fee_amount, 10);
         // Sell 10 lots at 95 = 950, fee ceil(9.5) = 10, net 940.
-        let q = compute_quote(10, false, &h, &books, 0, None).unwrap();
+        let q = compute_quote(10, false, &h, &books, 0, None, 0).unwrap();
         assert_eq!(q.out_amount, 940);
         assert_eq!(q.fee_amount, 10);
+        assert_eq!(q.builder_fee_amount, 0);
+    }
+
+    #[test]
+    fn test_builder_fee_scales_the_buy_budget_and_nets_the_sell_payout() {
+        let h = header(0, 10_000); // 1% taker fee
+        let books = vec![(Pubkey::new_unique(), book(100, &[(10, -5)], &[(10, 5)], 0))];
+        let builder = 10_000u32; // 1% builder fee, the program cap
+
+        // Buy: 1020 lots pre-scale by PPM/(PPM + 1% + 1%) -> 1000 -> 9 lots at
+        // 105 (945). Taker fee ceil(9.45) = 10, builder floor(9.45) = 9.
+        let q = compute_quote(1_020, true, &h, &books, 0, None, builder).unwrap();
+        assert_eq!(q.out_amount, 9 * 1_000_000);
+        assert_eq!(q.fee_amount, 19);
+        assert_eq!(q.builder_fee_amount, 9);
+        // The whole level (10 lots = 1050) needs a 1061 budget at 1% taker fee
+        // (1061e6 / 1.01e6 = 1050) but only affords 9 lots once the builder fee
+        // is in the denominator (1061e6 / 1.02e6 = 1040) — the quote a fee-blind
+        // engine would have given overstates the fill by a lot.
+        let q = compute_quote(1_061, true, &h, &books, 0, None, 0).unwrap();
+        assert_eq!(q.out_amount, 10 * 1_000_000);
+        let q = compute_quote(1_061, true, &h, &books, 0, None, builder).unwrap();
+        assert_eq!(q.out_amount, 9 * 1_000_000);
+        let q = compute_quote(1_071, true, &h, &books, 0, None, builder).unwrap();
+        assert_eq!(q.out_amount, 10 * 1_000_000);
+
+        // Sell 10 lots at 95 = 950. Taker ceil(9.5) = 10, builder floor(9.5) = 9,
+        // payout 950 - 10 - 9 = 931 — `quote_with_all_fees(false)` on chain.
+        let q = compute_quote(10, false, &h, &books, 0, None, builder).unwrap();
+        assert_eq!(q.out_amount, 931);
+        assert_eq!(q.fee_amount, 19);
+        assert_eq!(q.builder_fee_amount, 9);
+    }
+
+    #[test]
+    fn test_builder_fee_applies_even_when_the_taker_fee_is_a_rebate() {
+        // A negative taker fee is not pre-applied, but the builder fee still is.
+        let h = header(0, -10_000);
+        let books = vec![(Pubkey::new_unique(), book(100, &[(10, -5)], &[(10, 5)], 0))];
+        // No builder fee: the whole 1000 matches -> 9 lots (945), rebate 9.
+        let q = compute_quote(1_000, true, &h, &books, 0, None, 0).unwrap();
+        assert_eq!(q.out_amount, 9 * 1_000_000);
+        assert_eq!(q.fee_amount, 9);
+        // 1% builder: 1000 * 1e6 / 1.01e6 = 990 -> still 9 lots; fee = 9 + 9.
+        let q = compute_quote(1_000, true, &h, &books, 0, None, 10_000).unwrap();
+        assert_eq!(q.out_amount, 9 * 1_000_000);
+        assert_eq!(q.fee_amount, 18);
+        assert_eq!(q.builder_fee_amount, 9);
+        // Sell: 950 + 9 rebate - 9 builder = 950.
+        let q = compute_quote(10, false, &h, &books, 0, None, 10_000).unwrap();
+        assert_eq!(q.out_amount, 950);
+    }
+
+    #[test]
+    fn test_builder_fee_above_the_program_cap_is_refused() {
+        let h = header(0, 0);
+        let books = vec![(Pubkey::new_unique(), book(100, &[(10, -5)], &[(10, 5)], 0))];
+        assert!(compute_quote(100, true, &h, &books, 0, None, MAX_BUILDER_FEE_PPM).is_ok());
+        assert!(compute_quote(100, true, &h, &books, 0, None, MAX_BUILDER_FEE_PPM + 1).is_err());
     }
 
     #[test]
@@ -817,7 +916,7 @@ mod tests {
         let books = vec![(Pubkey::new_unique(), b)];
 
         let started = std::time::Instant::now();
-        let result = compute_quote(1, true, &h, &books, 0, None);
+        let result = compute_quote(1, true, &h, &books, 0, None, 0);
         assert!(started.elapsed().as_millis() < 500, "quote must refuse quickly, took {:?}", started.elapsed());
         assert!(
             matches!(&result, Err(e) if format!("{e}").contains("fill count")),

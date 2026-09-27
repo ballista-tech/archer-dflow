@@ -102,9 +102,10 @@ fn engine_never_panics_on_adversarial_state() {
         let slot = edge_u64(&mut rng);
         let is_buy = rng.random_bool(0.5);
         let taker = if rng.random_bool(0.3) { Some(books.first().map(|(_, b)| b.maker).unwrap_or_default()) } else { None };
+        let builder_fee_ppm = if rng.random_bool(0.3) { rng.random_range(0..=20_000u32) } else { 0 };
         let started = std::time::Instant::now();
         let r = catch_unwind(AssertUnwindSafe(|| {
-            compute_quote(amount, is_buy, &header, &books, slot, taker.as_ref())
+            compute_quote(amount, is_buy, &header, &books, slot, taker.as_ref(), builder_fee_ppm)
         }));
         assert!(r.is_ok(), "engine panicked: buy={is_buy} amount={amount} books={n}");
         // A hang is as much a denial of service as a panic.

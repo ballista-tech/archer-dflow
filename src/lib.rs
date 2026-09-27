@@ -74,9 +74,21 @@ pub struct ArcherAmm {
     /// because the program requires a writable account there even at zero fee
     /// (and never reads or pays it). To earn a builder fee, update this crate
     /// to set a quote-mint token account of your choice here and send a
-    /// non-zero `builder_fee_ppm` (capped at 10_000) in the swap instruction
-    /// data. The wallet must not be the market's quote vault.
+    /// non-zero [`builder_fee_ppm`] (capped at `MAX_BUILDER_FEE_PPM`); the
+    /// same value must go into the swap instruction data. The wallet must not
+    /// be the market's quote vault.
+    ///
+    /// [`builder_fee_ppm`]: Self::builder_fee_ppm
     pub builder_fee_wallet: Option<Pubkey>,
+
+    /// Builder fee in parts-per-million of the quote notional, paid by the
+    /// taker on top of the protocol taker fee and routed to
+    /// [`builder_fee_wallet`]. Ignored unless that wallet is set. Quotes fold
+    /// it into the buy-side budget and the sell-side payout exactly as the
+    /// program does, so the swap instruction **must** carry the same value.
+    ///
+    /// [`builder_fee_wallet`]: Self::builder_fee_wallet
+    pub builder_fee_ppm: u32,
 }
 
 impl ArcherAmm {
@@ -86,6 +98,17 @@ impl ArcherAmm {
 
     fn current_epoch(&self) -> u64 {
         self.clock_ref.epoch.load(Ordering::Relaxed)
+    }
+
+    /// The builder fee the swap will actually charge: the configured ppm only
+    /// when a wallet is set to receive it. Without a wallet the instruction
+    /// falls back to the taker's own account, so charging would be pointless.
+    pub fn effective_builder_fee_ppm(&self) -> u32 {
+        if self.builder_fee_wallet.is_some() {
+            self.builder_fee_ppm
+        } else {
+            0
+        }
     }
 }
 
@@ -118,6 +141,7 @@ impl Amm for ArcherAmm {
             quote_mint_data: vec![],
             clock_ref: amm_context.clock_ref.clone(),
             builder_fee_wallet: None,
+            builder_fee_ppm: 0,
         })
     }
 
@@ -255,9 +279,14 @@ impl Amm for ArcherAmm {
             .checked_div(atoms_per_lot)
             .ok_or_else(|| anyhow!("lot size is 0"))?;
 
+        // `QuoteParams` carries no taker, so the quote can't exclude the
+        // taker's own book here; `get_swap_and_account_metas` does, from the
+        // transfer authority. A maker quoting through DFlow therefore sees a
+        // quote that may include their own book — the program skips it.
         let QuoteOutput {
             out_amount,
             fee_amount: _,
+            builder_fee_amount: _,
         } = compute_quote(
             available_lots,
             is_buy,
@@ -265,6 +294,7 @@ impl Amm for ArcherAmm {
             &self.maker_books,
             current_slot,
             None,
+            self.effective_builder_fee_ppm(),
         )
         .map_err(|e| anyhow!("{e}"))?;
 
@@ -320,9 +350,12 @@ impl Amm for ArcherAmm {
             AccountMeta::new_readonly(self.quote_token_program, false),
         ];
 
+        // Exclude the taker's own (or delegated) book: the program skips it as
+        // a self-match, so attaching it only spends account slots.
+        let taker = &swap_params.token_transfer_authority;
         let current_slot = self.current_slot();
         for (book_key, book) in &self.maker_books {
-            if book_is_eligible(book, current_slot, None, header.maker_fee_ppm) {
+            if book_is_eligible(book, current_slot, Some(taker), header.maker_fee_ppm) {
                 account_metas.push(AccountMeta::new(*book_key, false));
             }
         }
