@@ -13,7 +13,8 @@ use dflow_amm_interface::{
     SwapAndAccountMetas, SwapParams,
 };
 
-use crate::quote::{book_is_eligible, compute_quote, QuoteOutput};
+use crate::error::ArcherAmmError;
+use crate::quote::{book_is_eligible, compute_quote, unspent_input_within_cap, QuoteOutput};
 use archer_sdk::onchain::{MakerBook, MarketStateHeader, MARKET_STATE_DISCRIMINATOR};
 
 mod decode {
@@ -287,6 +288,7 @@ impl Amm for ArcherAmm {
             out_amount,
             fee_amount: _,
             builder_fee_amount: _,
+            input_lots_spent,
         } = compute_quote(
             available_lots,
             is_buy,
@@ -297,6 +299,31 @@ impl Amm for ArcherAmm {
             self.effective_builder_fee_ppm(),
         )
         .map_err(|e| anyhow!("{e}"))?;
+
+        // The program debits only what it fills, in whole lots, so part of the
+        // requested amount can stay in the taker's account. `in_amount` stays
+        // the request (the host contract), which makes the implied price
+        // understate the real one by the unspent share; past the cap, decline.
+        if out_amount > 0 {
+            let spent_atoms = input_lots_spent
+                .checked_mul(atoms_per_lot)
+                .ok_or_else(|| anyhow!("input spent overflow"))?;
+            let spent_with_transfer_fee = spent_atoms
+                .checked_add(
+                    transfer_fee_atoms(input_mint_data, input_token_program, spent_atoms, current_epoch)
+                        .map_err(|e| anyhow!("{e}"))?,
+                )
+                .ok_or_else(|| anyhow!("input spent overflow"))?;
+            let within_cap = unspent_input_within_cap(quote_params.amount, spent_with_transfer_fee)
+                .map_err(|e| anyhow!("{e}"))?;
+            if !within_cap {
+                return Err(anyhow!(
+                    "{}: would spend {spent_with_transfer_fee} of {} requested atoms",
+                    ArcherAmmError::UnspentInputAboveCap,
+                    quote_params.amount
+                ));
+            }
+        }
 
         let output_transfer_fee = transfer_fee_atoms(
             output_mint_data,

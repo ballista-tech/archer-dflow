@@ -16,6 +16,9 @@ pub enum ArcherAmmError {
 
     #[error("No matching liquidity")]
     NoMatchingLiquidity,
+
+    #[error("Unspent input above cap")]
+    UnspentInputAboveCap,
 }
 
 impl From<archer_sdk::onchain::ArcherError> for ArcherAmmError {

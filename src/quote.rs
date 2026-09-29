@@ -28,6 +28,25 @@ pub struct QuoteOutput {
     /// The builder-fee share of `fee_amount`, in quote atoms. Zero when the
     /// swap carries no builder fee.
     pub builder_fee_amount: u64,
+    /// Input the program will actually debit, in lots of the input mint
+    /// (before any Token-2022 transfer fee).
+    pub input_lots_spent: u64,
+}
+
+pub const MAX_UNSPENT_INPUT_BPS: u64 = 100;
+
+pub fn unspent_input_within_cap(requested: u64, spent: u64) -> Result<bool, ArcherAmmError> {
+    let unspent = match requested.checked_sub(spent) {
+        Some(unspent) => unspent,
+        None => return Ok(true),
+    };
+    let unspent_scaled = (unspent as u128)
+        .checked_mul(10_000)
+        .ok_or_else(|| ArcherAmmError::MathError("unspent input overflow".into()))?;
+    let allowed_scaled = (requested as u128)
+        .checked_mul(MAX_UNSPENT_INPUT_BPS as u128)
+        .ok_or_else(|| ArcherAmmError::MathError("unspent cap overflow".into()))?;
+    Ok(unspent_scaled <= allowed_scaled)
 }
 
 /// Quote an ExactIn swap of `input_lots` against `maker_books`, mirroring the
@@ -199,10 +218,23 @@ fn quote_buy_exact_in(
     let (fee_atoms, builder_fee_atoms) =
         fee_atoms(header, taker_fee_lots, builder_fee_lots)?;
 
+    // The taker's quote leg: notional plus the taker fee (or less the rebate)
+    // into the vault, plus the builder fee straight to the builder wallet.
+    let with_taker_fee = if taker_fee_lots >= 0 {
+        total_quote_lots_matched.checked_add(taker_fee_lots as u64)
+    } else {
+        total_quote_lots_matched.checked_sub(taker_fee_lots.unsigned_abs())
+    }
+    .ok_or_else(|| ArcherAmmError::MathError("input spent overflow".into()))?;
+    let input_lots_spent = with_taker_fee
+        .checked_add(builder_fee_lots)
+        .ok_or_else(|| ArcherAmmError::MathError("input spent overflow".into()))?;
+
     Ok(QuoteOutput {
         out_amount: out_base_atoms,
         fee_amount: fee_atoms,
         builder_fee_amount: builder_fee_atoms,
+        input_lots_spent,
     })
 }
 
@@ -278,6 +310,9 @@ fn quote_sell_exact_in(
         i = group_end;
     }
 
+    let input_lots_spent = input_base_lots
+        .checked_sub(remaining_base_lots)
+        .ok_or_else(|| ArcherAmmError::MathError("input spent underflow".into()))?;
     let taker_fee_lots = calculate_fee(total_quote_lots_matched, effective_taker_fee_ppm)?;
     let builder_fee_lots = builder_fee_for(total_quote_lots_matched, builder_fee_ppm)?;
 
@@ -307,6 +342,7 @@ fn quote_sell_exact_in(
         out_amount: out_quote_atoms,
         fee_amount: fee_atoms,
         builder_fee_amount: builder_fee_atoms,
+        input_lots_spent,
     })
 }
 
@@ -928,5 +964,51 @@ mod tests {
     fn layout_sizes_match_the_program() {
         assert_eq!(core::mem::size_of::<MakerBook>(), 776);
         assert_eq!(core::mem::size_of::<MarketStateHeader>(), 272);
+    }
+
+    #[test]
+    fn buy_reports_the_notional_plus_taker_fee_as_spent() {
+        // One ask at 105 (mid 100, +5), 10 lots deep; 0.1% taker fee.
+        let h = header(0, 1_000);
+        let books = vec![(Pubkey::new_unique(), book(100, &[], &[(10, 5)], 0))];
+        // Budget 250 lots → 249 after the fee pre-scale → 2 base lots at 105
+        // (210 quote lots) + ceil(0.21) = 1 lot fee. 39 lots stay unspent.
+        let q = compute_quote(250, true, &h, &books, 0, None, 0).unwrap();
+        assert_eq!(q.out_amount, 2 * 1_000_000);
+        assert_eq!(q.input_lots_spent, 211);
+    }
+
+    #[test]
+    fn buy_spent_includes_the_builder_fee() {
+        let h = header(0, 0);
+        let books = vec![(Pubkey::new_unique(), book(100, &[], &[(20, 5)], 0))];
+        // 1000 lots → 990 after the 1% builder pre-scale → 9 base lots at 105
+        // (945) + floor(9.45) = 9 builder fee.
+        let q = compute_quote(1_000, true, &h, &books, 0, None, 10_000).unwrap();
+        assert_eq!(q.out_amount, 9 * 1_000_000);
+        assert_eq!(q.input_lots_spent, 954);
+    }
+
+    #[test]
+    fn sell_reports_only_the_base_lots_matched() {
+        // Five lots bid at 95; selling eight fills five and leaves three.
+        let h = header(0, 0);
+        let books = vec![(Pubkey::new_unique(), book(100, &[(5, -5)], &[], 0))];
+        let q = compute_quote(8, false, &h, &books, 0, None, 0).unwrap();
+        assert_eq!(q.out_amount, 5 * 95);
+        assert_eq!(q.input_lots_spent, 5);
+    }
+
+    #[test]
+    fn unspent_cap_boundary() {
+        // Exactly 100 bps unspent is allowed; one atom more is not.
+        assert!(unspent_input_within_cap(10_000, 9_900).unwrap());
+        assert!(!unspent_input_within_cap(10_000, 9_899).unwrap());
+        assert!(unspent_input_within_cap(10_000, 10_000).unwrap());
+        // Spending more than requested (transfer-fee rounding) is never unspent.
+        assert!(unspent_input_within_cap(10_000, 10_050).unwrap());
+        assert!(unspent_input_within_cap(0, 0).unwrap());
+        assert!(!unspent_input_within_cap(u64::MAX, 0).unwrap());
+        assert!(unspent_input_within_cap(u64::MAX, u64::MAX).unwrap());
     }
 }
