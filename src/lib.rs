@@ -48,6 +48,16 @@ pub const ARCHER_PROGRAM_ID: Pubkey =
 const SPL_TOKEN_PROGRAM: Pubkey =
     solana_program::pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 
+/// The `LastRestartSlot` sysvar, watched alongside the market accounts.
+pub const LAST_RESTART_SLOT_SYSVAR: Pubkey = solana_program::sysvar::last_restart_slot::ID;
+
+/// The restart slot a `LastRestartSlot` sysvar account holds: a `u64` LE.
+fn read_last_restart_slot(data: &[u8]) -> Option<u64> {
+    data.get(..8)
+        .and_then(|b| b.try_into().ok())
+        .map(u64::from_le_bytes)
+}
+
 const TOKEN_2022_PROGRAM: Pubkey =
     solana_program::pubkey!("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
 
@@ -67,6 +77,15 @@ pub struct ArcherAmm {
     quote_mint_data: Vec<u8>,
 
     pub clock_ref: ClockRef,
+
+    /// Slot of the cluster's most recent restart, from the `LastRestartSlot`
+    /// sysvar; `0` until the sysvar has been seen, or on a chain that never
+    /// restarted. Slots barely advance while the cluster is halted, so a
+    /// book's `expiry_in_slots` cannot tell a quote from before an outage
+    /// apart from a fresh one; the program skips any book whose
+    /// `last_updated_slot` is below this, and so does `update`, so a quote
+    /// never shows liquidity the program refuses after a restart.
+    pub last_restart_slot: u64,
 
     /// Quote token account that receives the builder fee.
     ///
@@ -141,6 +160,7 @@ impl Amm for ArcherAmm {
             base_mint_data: vec![],
             quote_mint_data: vec![],
             clock_ref: amm_context.clock_ref.clone(),
+            last_restart_slot: 0,
             builder_fee_wallet: None,
             builder_fee_ppm: 0,
         })
@@ -166,7 +186,7 @@ impl Amm for ArcherAmm {
     }
 
     fn get_accounts_to_update(&self) -> Vec<Pubkey> {
-        let mut accounts = vec![self.market_key, self.registry_key];
+        let mut accounts = vec![self.market_key, self.registry_key, LAST_RESTART_SLOT_SYSVAR];
         accounts.extend_from_slice(&self.maker_book_keys);
         if let Some(h) = &self.market_header {
             accounts.push(h.base_mint);
@@ -176,6 +196,13 @@ impl Amm for ArcherAmm {
     }
 
     fn update(&mut self, account_map: &AccountMap) -> Result<()> {
+        if let Some(slot) = account_map
+            .get(&LAST_RESTART_SLOT_SYSVAR)
+            .and_then(|a| read_last_restart_slot(&a.data))
+        {
+            self.last_restart_slot = slot;
+        }
+
         if let Some(market_account) = account_map.get(&self.market_key) {
             let header = decode::market_header(&market_account.data)
                 .map_err(|e| anyhow!("Failed to deserialize market: {e}"))?;
@@ -215,7 +242,14 @@ impl Amm for ArcherAmm {
         for book_key in &self.maker_book_keys {
             if let Some(book_account) = account_map.get(book_key) {
                 if let Ok(book) = decode::maker_book(&book_account.data) {
-                    if book.market == self.market_key && book.get_status().is_ok() {
+                    // A book quoted before the last cluster restart is skipped
+                    // by the program until its maker re-quotes; keep it out of
+                    // the set so quotes and swap accounts agree with that.
+                    let quoted_since_restart = book.last_updated_slot >= self.last_restart_slot;
+                    if book.market == self.market_key
+                        && book.get_status().is_ok()
+                        && quoted_since_restart
+                    {
                         self.maker_books.push((*book_key, book));
                     }
                 }
@@ -459,4 +493,106 @@ fn transfer_fee_atoms(
         .ok_or_else(|| anyhow!("transfer fee overflow"))?;
 
     Ok(fee)
+}
+
+#[cfg(test)]
+mod restart_gate_tests {
+    use super::*;
+    use archer_sdk::onchain::{
+        MakerBookStatus, MakerRegistry, MAKER_BOOK_DISCRIMINATOR, MAKER_REGISTRY_DISCRIMINATOR,
+    };
+    use bytemuck::Zeroable;
+    use solana_sdk::account::Account;
+
+    fn account(data: Vec<u8>) -> Account {
+        Account {
+            lamports: 1,
+            data,
+            owner: ARCHER_PROGRAM_ID,
+            executable: false,
+            rent_epoch: 0,
+        }
+    }
+
+    fn book(market: Pubkey, last_updated_slot: u64) -> (Pubkey, Account) {
+        let mut b = MakerBook::zeroed();
+        b.discriminator = *MAKER_BOOK_DISCRIMINATOR;
+        b.market = market;
+        b.status = MakerBookStatus::Active as u8;
+        b.last_updated_slot = last_updated_slot;
+        (Pubkey::new_unique(), account(bytemuck::bytes_of(&b).to_vec()))
+    }
+
+    /// An AMM updated twice (registry, then books) from a market with one
+    /// book quoted at slot 90 and one at slot 97, with the sysvar present
+    /// or not. Returns the AMM and the two book keys in that order.
+    fn amm_after_update(last_restart_slot: Option<u64>) -> (ArcherAmm, Pubkey, Pubkey) {
+        let mut h = MarketStateHeader::zeroed();
+        h.discriminator = *MARKET_STATE_DISCRIMINATOR;
+        let market_key = Pubkey::new_unique();
+        let market_account = account(bytemuck::bytes_of(&h).to_vec());
+        let keyed = KeyedAccount {
+            key: market_key,
+            account: market_account.clone(),
+            params: None,
+        };
+        let ctx = AmmContext {
+            clock_ref: ClockRef::default(),
+        };
+        let mut amm = ArcherAmm::from_keyed_account(&keyed, &ctx).unwrap();
+
+        let (old_key, old_book) = book(market_key, 90);
+        let (new_key, new_book) = book(market_key, 97);
+        let mut r = MakerRegistry::zeroed();
+        r.discriminator = *MAKER_REGISTRY_DISCRIMINATOR;
+        r.market = market_key;
+        r.num_makers = 2;
+        r.makers[0] = old_key;
+        r.makers[1] = new_key;
+
+        let mut map = AccountMap::default();
+        map.insert(market_key, market_account);
+        map.insert(amm.registry_key, account(bytemuck::bytes_of(&r).to_vec()));
+        map.insert(old_key, old_book);
+        map.insert(new_key, new_book);
+        if let Some(slot) = last_restart_slot {
+            map.insert(LAST_RESTART_SLOT_SYSVAR, account(slot.to_le_bytes().to_vec()));
+        }
+        amm.update(&map).unwrap();
+        amm.update(&map).unwrap();
+        (amm, old_key, new_key)
+    }
+
+    fn loaded(amm: &ArcherAmm) -> Vec<Pubkey> {
+        amm.maker_books.iter().map(|(k, _)| *k).collect()
+    }
+
+    #[test]
+    fn sysvar_is_watched() {
+        let (amm, _, _) = amm_after_update(None);
+        assert!(amm.get_accounts_to_update().contains(&LAST_RESTART_SLOT_SYSVAR));
+    }
+
+    #[test]
+    fn book_quoted_before_restart_is_dropped() {
+        let (amm, old_key, new_key) = amm_after_update(Some(95));
+        assert_eq!(amm.last_restart_slot, 95);
+        assert_eq!(loaded(&amm), vec![new_key]);
+        assert!(!loaded(&amm).contains(&old_key));
+    }
+
+    #[test]
+    fn book_quoted_at_restart_slot_is_kept() {
+        let (amm, _, new_key) = amm_after_update(Some(97));
+        assert_eq!(loaded(&amm), vec![new_key]);
+    }
+
+    #[test]
+    fn no_sysvar_or_no_restart_gates_nothing() {
+        let (amm, old_key, new_key) = amm_after_update(None);
+        assert_eq!(amm.last_restart_slot, 0);
+        assert_eq!(loaded(&amm), vec![old_key, new_key]);
+        let (amm, old_key, new_key) = amm_after_update(Some(0));
+        assert_eq!(loaded(&amm), vec![old_key, new_key]);
+    }
 }
