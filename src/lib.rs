@@ -83,7 +83,7 @@ pub struct ArcherAmm {
     /// restarted. Slots barely advance while the cluster is halted, so a
     /// book's `expiry_in_slots` cannot tell a quote from before an outage
     /// apart from a fresh one; the program skips any book whose
-    /// `last_updated_slot` is below this, and so does `update`, so a quote
+    /// `last_updated_slot` is at or below this, and so does `update`, so a quote
     /// never shows liquidity the program refuses after a restart.
     pub last_restart_slot: u64,
 
@@ -242,10 +242,13 @@ impl Amm for ArcherAmm {
         for book_key in &self.maker_book_keys {
             if let Some(book_account) = account_map.get(book_key) {
                 if let Ok(book) = decode::maker_book(&book_account.data) {
-                    // A book quoted before the last cluster restart is skipped
-                    // by the program until its maker re-quotes; keep it out of
-                    // the set so quotes and swap accounts agree with that.
-                    let quoted_since_restart = book.last_updated_slot >= self.last_restart_slot;
+                    // A book quoted at or before the last cluster restart (the
+                    // hard-fork slot) is skipped by the program until its maker
+                    // re-quotes; keep it out of the set so quotes and swap
+                    // accounts agree with that. A restart slot of 0 means the
+                    // chain never restarted and gates nothing.
+                    let quoted_since_restart = self.last_restart_slot == 0
+                        || book.last_updated_slot > self.last_restart_slot;
                     if book.market == self.market_key
                         && book.get_status().is_ok()
                         && quoted_since_restart
@@ -582,8 +585,16 @@ mod restart_gate_tests {
     }
 
     #[test]
-    fn book_quoted_at_restart_slot_is_kept() {
-        let (amm, _, new_key) = amm_after_update(Some(97));
+    fn book_quoted_at_restart_slot_is_dropped() {
+        // The restart slot is the hard-fork slot: a book touched there was
+        // quoted before the resumed chain.
+        let (amm, _, _) = amm_after_update(Some(97));
+        assert!(loaded(&amm).is_empty());
+    }
+
+    #[test]
+    fn book_quoted_after_restart_slot_is_kept() {
+        let (amm, _, new_key) = amm_after_update(Some(96));
         assert_eq!(loaded(&amm), vec![new_key]);
     }
 
