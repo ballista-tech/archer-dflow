@@ -92,7 +92,7 @@ use litesvm::LiteSVM;
         amm: &ArcherAmm,
         input_mint: &Pubkey,
         output_mint: &Pubkey,
-    ) -> (u64, u64) {
+    ) -> Option<(u64, u64)> {
         let header = amm.market_header.as_ref().unwrap();
         let is_buy = *input_mint == header.quote_mint;
 
@@ -102,48 +102,48 @@ use litesvm::LiteSVM;
             header.base_atoms_per_base_lot.as_u64()
         };
 
-        let quote_output = |amount: u64| -> u64 {
-            amm.quote(&QuoteParams {
-                amount,
-                input_mint: *input_mint,
-                output_mint: *output_mint,
-                swap_mode: SwapMode::ExactIn,
-            })
-            .map(|r| r.out_amount)
-            .unwrap_or(0)
-        };
+        let accepted = |amount: u64| -> bool { quote_accepted(amm, *input_mint, *output_mint, amount).is_some() };
 
-        let max_output = quote_output(u64::MAX / 2);
-        if max_output == 0 {
-            return (min_lot, min_lot);
+        // Scan the whole range: refusals for lot rounding can sit between accepted amounts.
+        let (mut lower, mut last_accepted, mut refused_above) = (None, None, None);
+        let mut amount = min_lot.max(1);
+        while amount <= u64::MAX / 2 {
+            if accepted(amount) {
+                lower.get_or_insert(amount);
+                last_accepted = Some(amount);
+                refused_above = None;
+            } else if last_accepted.is_some() && refused_above.is_none() {
+                refused_above = Some(amount);
+            }
+            amount = amount.saturating_mul(2);
         }
-
-        let mut lo = min_lot;
-        let mut hi = u64::MAX / 2;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            if quote_output(mid) > 0 {
-                hi = mid;
-            } else {
-                lo = mid + 1;
+        let (lower, mut lo) = (lower?, last_accepted?);
+        if let Some(mut hi) = refused_above {
+            while hi - lo > 1 {
+                let mid = lo + (hi - lo) / 2;
+                if accepted(mid) {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
             }
         }
-        let lower_bound = lo;
-
-        lo = lower_bound;
-        hi = u64::MAX / 2;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            if quote_output(mid) >= max_output {
-                hi = mid;
-            } else {
-                lo = mid + 1;
-            }
-        }
-        let upper_bound = lo;
-
-        (lower_bound, upper_bound)
+        Some((lower, lo))
     }
+
+    /// The quoted output for `amount`, or `None` if the AMM refuses it (no liquidity, or more
+    /// than `MAX_UNSPENT_INPUT_BPS` of the input would go unspent) or it would fill nothing.
+    fn quote_accepted(amm: &ArcherAmm, input_mint: Pubkey, output_mint: Pubkey, amount: u64) -> Option<u64> {
+        amm.quote(&QuoteParams { amount, input_mint, output_mint, swap_mode: SwapMode::ExactIn })
+            .ok()
+            .map(|r| r.out_amount)
+            .filter(|&out| out > 0)
+    }
+
+    /// Each direction must cross-check at least this many accepted amounts, so a test cannot
+    /// pass by skipping everything.
+    const MIN_CHECKS_PER_SIDE: usize = 10;
+
 
     pub fn setup_litesvm() -> (LiteSVM, Keypair) {
         let mut litesvm = LiteSVM::new()
@@ -491,28 +491,16 @@ use litesvm::LiteSVM;
             (quote_mint, base_mint),  // buy second
         ];
 
+        let mut checked = 0;
         for (input_mint, output_mint) in &directions {
-            let (lower, upper) = compute_bounds(&amm, input_mint, output_mint);
+            let Some((lower, upper)) = compute_bounds(&amm, input_mint, output_mint) else {
+                log::warn!("No liquidity for input mint {input_mint}; side skipped");
+                continue;
+            };
 
             for bound in [lower, upper] {
-                let quote = amm
-                    .quote(&QuoteParams {
-                        amount: bound,
-                        input_mint: *input_mint,
-                        output_mint: *output_mint,
-                        swap_mode: SwapMode::ExactIn,
-                    })
-                    .unwrap();
-
-                // If the off-chain quote is zero, the market currently has no active
-                // liquidity (every maker book stale/empty). On-chain the swap returns
-                // NoMatchingLiquidity rather than a 0 output, so there is nothing to
-                // cross-check — both agree there is no fill.
-                if quote.out_amount == 0 {
-                    log::warn!("No liquidity at bound {bound}; skipping sim cross-check");
-                    continue;
-                }
-
+                // Both bounds are accepted amounts by construction.
+                let quote = quote_accepted(&amm, *input_mint, *output_mint, bound).expect("bound quote refused");
                 let sim = sim_quote_request(
                     &amm,
                     *input_mint,
@@ -526,13 +514,15 @@ use litesvm::LiteSVM;
                     "Boundary = {}\nSimulated = {}\nOff-chain quote = {}\nDelta = {}",
                     bound,
                     sim,
-                    quote.out_amount,
-                    quote.out_amount.abs_diff(sim)
+                    quote,
+                    quote.abs_diff(sim)
                 );
 
-                assert_eq!(quote.out_amount.abs_diff(sim), 0)
+                assert_eq!(quote, sim, "quote and execution disagree at bound {bound}");
+                checked += 1;
             }
         }
+        assert!(checked > 0, "Market has no liquidity on either side; point ARCHER_MARKET_KEY at a quoted market");
     }
 
     // -------------------------------------------------------------------------
@@ -567,26 +557,23 @@ use litesvm::LiteSVM;
             (base_mint, quote_mint),
         ];
 
+        let mut sides = 0;
         for (input_mint, output_mint) in &directions {
-            let (lb, ub) = compute_bounds(&amm, input_mint, output_mint);
+            let Some((lb, ub)) = compute_bounds(&amm, input_mint, output_mint) else {
+                log::warn!("No liquidity for input mint {input_mint}; side skipped");
+                continue;
+            };
+            sides += 1;
 
+            let mut checked = 0;
             for _ in 0..50 {
                 let amount = sample_log_uniform_u64(lb, ub);
 
-                let quote = amm
-                    .quote(&QuoteParams {
-                        amount,
-                        input_mint: *input_mint,
-                        output_mint: *output_mint,
-                        swap_mode: SwapMode::ExactIn,
-                    })
-                    .unwrap();
-
-                // No active liquidity right now → on-chain returns NoMatchingLiquidity
-                // rather than a 0 output; nothing to cross-check.
-                if quote.out_amount == 0 {
+                // A refused amount (unspent above the cap, between deep levels) has nothing
+                // to cross-check: the AMM would not route it.
+                let Some(quote) = quote_accepted(&amm, *input_mint, *output_mint, amount) else {
                     continue;
-                }
+                };
 
                 let sim = sim_quote_request(
                     &amm,
@@ -600,13 +587,19 @@ use litesvm::LiteSVM;
                 log::debug!(
                     "Random sim: {}\nQuote: {}\nDelta: {}",
                     sim,
-                    quote.out_amount,
-                    quote.out_amount.abs_diff(sim)
+                    quote,
+                    quote.abs_diff(sim)
                 );
 
-                assert_eq!(quote.out_amount.abs_diff(sim), 0)
+                assert_eq!(quote, sim, "quote and execution disagree at {amount}");
+                checked += 1;
             }
+            assert!(
+                checked >= MIN_CHECKS_PER_SIDE,
+                "only {checked} of 50 samples for input mint {input_mint} were quoted; the cross-check is too thin"
+            );
         }
+        assert!(sides > 0, "Market has no liquidity on either side; point ARCHER_MARKET_KEY at a quoted market");
     }
 
     // -------------------------------------------------------------------------
@@ -629,8 +622,13 @@ use litesvm::LiteSVM;
             (base_mint, quote_mint),
         ];
 
+        let mut sides = 0;
         for (input_mint, output_mint) in &directions {
-            let (lb, ub) = compute_bounds(&amm, &input_mint, &output_mint);
+            let Some((lb, ub)) = compute_bounds(&amm, input_mint, output_mint) else {
+                log::warn!("No liquidity for input mint {input_mint}; side skipped");
+                continue;
+            };
+            sides += 1;
             let mut test_amounts = Vec::with_capacity(50);
 
             for _ in 0..50 {
@@ -638,29 +636,32 @@ use litesvm::LiteSVM;
             }
             test_amounts.sort();
 
+            // Over the amounts the AMM accepts, more input never buys less output.
             let mut prev = 0;
+            let mut checked = 0;
             for amount in test_amounts {
-                let result = amm
-                    .quote(&QuoteParams {
-                        amount,
-                        input_mint: *input_mint,
-                        output_mint: *output_mint,
-                        swap_mode: SwapMode::ExactIn,
-                    })
-                    .expect("Quote failed");
+                let Some(out) = quote_accepted(&amm, *input_mint, *output_mint, amount) else {
+                    continue;
+                };
 
-                log::debug!("quote: {:?}", result);
+                log::debug!("quote: {amount} -> {out}");
 
                 assert!(
-                    prev <= result.out_amount,
+                    prev <= out,
                     "Swap function is not monotone (prev: {}) > (output: {})",
                     prev,
-                    result.out_amount
+                    out
                 );
 
-                prev = result.out_amount;
+                prev = out;
+                checked += 1;
             }
+            assert!(
+                checked >= MIN_CHECKS_PER_SIDE,
+                "only {checked} of 50 samples for input mint {input_mint} were quoted; the check is too thin"
+            );
         }
+        assert!(sides > 0, "Market has no liquidity on either side; point ARCHER_MARKET_KEY at a quoted market");
     }
 
     // -------------------------------------------------------------------------
@@ -686,7 +687,10 @@ use litesvm::LiteSVM;
         ];
 
         for (input_mint, output_mint) in &directions {
-            let (lb, ub) = compute_bounds(&amm, input_mint, output_mint);
+            let Some((lb, ub)) = compute_bounds(&amm, input_mint, output_mint) else {
+                log::warn!("No liquidity for input mint {input_mint}; side skipped");
+                continue;
+            };
             let mut test_amounts = Vec::with_capacity(iterations);
 
             for _ in 0..iterations {
@@ -695,14 +699,13 @@ use litesvm::LiteSVM;
 
             let start = Instant::now();
             for amount in test_amounts {
-                let result = amm
-                    .quote(&QuoteParams {
-                        amount,
-                        input_mint: *input_mint,
-                        output_mint: *output_mint,
-                        swap_mode: SwapMode::ExactIn,
-                    })
-                    .expect("Quote failed");
+                // Refusals (unspent above the cap) are part of what a router calls; time them too.
+                let result = amm.quote(&QuoteParams {
+                    amount,
+                    input_mint: *input_mint,
+                    output_mint: *output_mint,
+                    swap_mode: SwapMode::ExactIn,
+                });
 
                 log::debug!("quote: {:?}", result);
             }

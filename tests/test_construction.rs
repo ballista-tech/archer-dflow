@@ -37,7 +37,7 @@ use std::env;
     }
 
     /// Compute quoting bounds for a given input mint direction.
-    fn compute_bounds(amm: &ArcherAmm, input_mint: &Pubkey, output_mint: &Pubkey) -> (u64, u64) {
+    fn compute_bounds(amm: &ArcherAmm, input_mint: &Pubkey, output_mint: &Pubkey) -> Option<(u64, u64)> {
         let mints = amm.get_reserve_mints();
         let is_buy = *input_mint == mints[1]; // quote mint is second
 
@@ -48,49 +48,41 @@ use std::env;
             header.base_atoms_per_base_lot.as_u64()
         };
 
-        let quote_output = |amount: u64| -> u64 {
+        let accepted = |amount: u64| -> bool {
             amm.quote(&QuoteParams {
                 amount,
                 input_mint: *input_mint,
                 output_mint: *output_mint,
                 swap_mode: SwapMode::ExactIn,
             })
-            .map(|r| r.out_amount)
-            .unwrap_or(0)
+            .is_ok_and(|r| r.out_amount > 0)
         };
 
-        let max_output = quote_output(u64::MAX / 2);
-        if max_output == 0 {
-            return (min_lot, min_lot);
+        // Scan the whole range: refusals for lot rounding can sit between accepted amounts.
+        let (mut lower, mut last_accepted, mut refused_above) = (None, None, None);
+        let mut amount = min_lot.max(1);
+        while amount <= u64::MAX / 2 {
+            if accepted(amount) {
+                lower.get_or_insert(amount);
+                last_accepted = Some(amount);
+                refused_above = None;
+            } else if last_accepted.is_some() && refused_above.is_none() {
+                refused_above = Some(amount);
+            }
+            amount = amount.saturating_mul(2);
         }
-
-        // Binary search for smallest input producing non-zero output
-        let mut lo = min_lot;
-        let mut hi = u64::MAX / 2;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            if quote_output(mid) > 0 {
-                hi = mid;
-            } else {
-                lo = mid + 1;
+        let (lower, mut lo) = (lower?, last_accepted?);
+        if let Some(mut hi) = refused_above {
+            while hi - lo > 1 {
+                let mid = lo + (hi - lo) / 2;
+                if accepted(mid) {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
             }
         }
-        let lower_bound = lo;
-
-        // Binary search for smallest input achieving max output (saturation)
-        lo = lower_bound;
-        hi = u64::MAX / 2;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            if quote_output(mid) >= max_output {
-                hi = mid;
-            } else {
-                lo = mid + 1;
-            }
-        }
-        let upper_bound = lo;
-
-        (lower_bound, upper_bound)
+        Some((lower, lo))
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -164,10 +156,16 @@ use std::env;
             (mints[0], mints[1]), // sell: base -> quote
         ];
 
+        let mut sides_checked = 0;
         for (input_mint, output_mint) in &token_pairs {
             log::info!("Checking bounds for input mint: {}", input_mint);
 
-            let (lower_bound, upper_bound) = compute_bounds(&amm, input_mint, output_mint);
+            let Some((lower_bound, upper_bound)) = compute_bounds(&amm, input_mint, output_mint) else {
+                log::warn!("No liquidity for input mint {}; side skipped", input_mint);
+                continue;
+            };
+            sides_checked += 1;
+            log::info!("Bounds: {} ..= {}", lower_bound, upper_bound);
 
             assert!(
                 lower_bound <= upper_bound,
@@ -197,6 +195,11 @@ use std::env;
 
             log::info!("Upper-bound quote: {:?}", ub_result);
             assert!(ub_result.out_amount > 0, "Upper bound produced zero output");
+            assert!(
+                ub_result.out_amount >= lb_result.out_amount,
+                "Upper bound produced less output than the lower bound"
+            );
         }
+        assert!(sides_checked > 0, "Market has no liquidity on either side; point ARCHER_MARKET_KEY at a quoted market");
     }
 }
